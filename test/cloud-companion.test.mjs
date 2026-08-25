@@ -83,7 +83,14 @@ function memoryConfigStore(overrides = {}) {
 function firstLanAddress() {
   return Object.values(os.networkInterfaces())
     .flat()
-    .find((entry) => entry?.family === "IPv4" && !entry.internal)?.address ?? null;
+    .find((entry) => {
+      if (!entry || entry.internal || entry.family !== "IPv4") return false;
+      const octets = entry.address.split(".").map(Number);
+      return octets[0] === 10
+        || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+        || (octets[0] === 192 && octets[1] === 168)
+        || (octets[0] === 169 && octets[1] === 254);
+    })?.address ?? null;
 }
 
 test("cloud config persists Basic Auth credentials and device mappings in a mode-0600 file", async () => {
