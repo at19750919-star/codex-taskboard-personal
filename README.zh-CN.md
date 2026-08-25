@@ -4,13 +4,15 @@
 
 一个本地优先的议题面板，可在浏览器中运行，也可通过独立 CDP 启动器或其注入脚本嵌入 Codex。同一套 HTTP API 为 React UI 和随附 Codex Skill 使用的 `taskctl` CLI 提供支持。
 
+> Windows 个人版使用方式请见 [Windows 第一版操作方式](docs/windows-first-run.md)。
+
 ![Codex Taskboard 产品截图](docs/assets/codex-taskboard.png)
 
 ## 系统要求
 
 - Node.js 22.5 或更高版本
 - 构建 macOS App 和 DMG：Xcode Command Line Tools、Rust 1.88 或更高版本，以及 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` target。`npm install` 会安装本项目使用的 Tauri CLI。
-- 构建 Windows NSIS：Microsoft Store 版 Codex App、Rust 1.88 或更高版本，以及带 C++ 工作负载和 Windows SDK 的 Visual Studio Build Tools。
+- 构建 Windows NSIS：Rust 1.88 或更高版本，以及带 C++ 工作负载和 Windows SDK 的 Visual Studio Build Tools。Windows 应用是独立原生窗口，不需要 Microsoft Store 版 Codex App。
 
 ## 本地运行
 
@@ -141,20 +143,24 @@ npm run app:build:linux:x64
 
 第一版不支持 ARM64、Fedora、RPM 软件包或其他 Linux 发行版。
 
-### Windows App：托盘启动器与内置 Taskboard
+### Windows App：独立窗口与内置 Taskboard
 
-先从 Microsoft Store 安装官方 Codex App。在 Windows x64 上运行以下命令构建当前用户级 NSIS 安装包：
+Windows 应用是独立的 Tauri 原生窗口。它会启动内置的本机 Taskboard 服务，等到 `/health` 就绪后打开 `http://127.0.0.1:<port>/`。它不会重启、结束、启动、注入或依赖官方 Codex 桌面应用。详见 [Windows 第一版操作方式](docs/windows-first-run.md)。
+
+在 Windows x64 上运行以下命令构建当前用户级 NSIS 安装包：
 
 ```powershell
 npm ci
 npm run app:build:windows
 ```
 
-安装包位于 `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`。它包含托盘启动器、内置 Node、本地服务、构建后的 Web UI、Skill、`taskctl.cmd` 和注入脚本。Taskboard 数据存储在 `%APPDATA%\Codex Taskboard`，日志存储在 `%LOCALAPPDATA%\Codex Taskboard\Logs`，Skill 会复制到 `%USERPROFILE%\.agents\skills\manage-taskboard`。
+安装包位于 `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`。它包含独立窗口应用、内置 Node、本地服务、构建后的 Web UI、Skill 和 `taskctl.cmd`。Taskboard 数据存储在 `%APPDATA%\Codex Taskboard`，日志存储在 `%LOCALAPPDATA%\Codex Taskboard\Logs`，Skill 会复制到 `%USERPROFILE%\.agents\skills\manage-taskboard`。
 
 Windows CI 产物目前有意保持未签名，也不支持自动更新。分发前请阅读[代码签名策略](docs/code-signing-policy.md)。保留数据的行为见 [Windows 卸载说明](docs/windows-uninstall.md)。
 
-Codex 26.715.52143 的渲染器 CSP 会阻止任意 HTTP iframe。因此，启动器会启用 CDP CSP 绕过，重新加载该渲染器一次，安装文档启动脚本，并等待 Taskboard OOPIF 实际加载。同一台机器上的其他进程访问 CDP 时不需要身份验证，因此启动器运行时只能运行受信任的本地代码。
+### 可选：从源码注入 Codex
+
+Codex 26.715.52143 的渲染器 CSP 会阻止任意 HTTP iframe。因此，源码注入器会启用 CDP CSP 绕过，重新加载该渲染器一次，安装文档启动脚本，并等待 Taskboard OOPIF 实际加载。同一台机器上的其他进程访问 CDP 时不需要身份验证，因此注入器运行时只能运行受信任的本地代码。Windows 独立应用不使用这条路径。
 
 要注入一个已经通过其他方式使用 CDP 启动的 Codex 实例，请运行：
 

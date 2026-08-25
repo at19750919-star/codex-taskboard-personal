@@ -363,7 +363,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-updater",
  "uuid",
- "windows",
 ]
 
 [[package]]

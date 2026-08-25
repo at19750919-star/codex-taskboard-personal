@@ -64,6 +64,31 @@ test("Windows CI runs the Node suite and the unsigned launcher skips unsupported
   );
 });
 
+test("Windows standalone starts the bundled service in a native window and never launches Codex", () => {
+  assert.match(launcherSource, /fn start_windows_standalone_locked/);
+  assert.match(launcherSource, /app_root\.join\("server\/index\.mjs"\)/);
+  assert.match(launcherSource, /fn wait_for_taskboard_ready/);
+  assert.match(launcherSource, /fn write_runtime_descriptor/);
+  assert.match(launcherSource, /WebviewUrl::External/);
+  assert.match(launcherSource, /CREATE_NO_WINDOW/);
+  assert.match(launcherSource, /任务面板已在独立窗口中打开/);
+  assert.match(
+    launcherSource,
+    /#\[cfg\(target_os = "windows"\)\][\s\S]*?return start_windows_standalone_locked/,
+  );
+  assert.doesNotMatch(launcherSource, /Get-AppxPackage -Name OpenAI\.Codex/);
+  assert.doesNotMatch(launcherSource, /请先从 Microsoft Store 安装/);
+  assert.doesNotMatch(launcherSource, /RmShutdown/);
+  assert.doesNotMatch(
+    launcherSource,
+    /#\[cfg\(target_os = "windows"\)\]\s+command\.arg\(r"scripts\\codex-injector\.mjs"\)/,
+  );
+  assert.doesNotMatch(
+    launcherSource,
+    /fn start_windows_standalone_locked[\s\S]*?--cdp-pipe[\s\S]*?fn start_launcher_locked/,
+  );
+});
+
 test("Windows CI uploads the NSIS installer with the pinned Node 24 artifact action", () => {
   assert.match(
     checkWorkflow,

@@ -1,13 +1,13 @@
 # Uninstall Codex Taskboard on Windows
 
-1. Quit Codex Taskboard from its system-tray menu.
+1. Close the Codex Taskboard window, or quit from its system-tray menu.
 2. Open **Settings > Apps > Installed apps**.
 3. Find **Codex Taskboard**, open its menu, and select **Uninstall**.
 4. Complete the NSIS uninstaller.
 
 The uninstaller removes the application files. It keeps Taskboard issues,
-attachments, settings, logs, the independent Codex profile, and the bundled
-Skill so that a later installation can reuse them.
+attachments, settings, logs, and the bundled Skill so that a later
+installation can reuse them.
 
 To remove that retained data, close Codex Taskboard and delete these directories
 for the current Windows user:

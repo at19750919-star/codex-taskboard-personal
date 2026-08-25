@@ -29,8 +29,8 @@ use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::{
     fs::{self, File, OpenOptions},
     future::{poll_fn, Future},
-    io::{BufRead, BufReader, Write},
-    net::TcpListener,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{
@@ -42,7 +42,7 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(target_os = "windows")]
-use std::{os::windows::fs::OpenOptionsExt, process::ChildStdin};
+use std::{os::windows::fs::OpenOptionsExt, os::windows::process::CommandExt, process::ChildStdin};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 use tauri::{
@@ -54,26 +54,9 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use uuid::Uuid;
-#[cfg(target_os = "windows")]
-use windows::{
-    core::PWSTR,
-    Win32::{
-        Foundation::{CloseHandle, ERROR_SUCCESS, FILETIME, WAIT_OBJECT_0},
-        System::{
-            RestartManager::{
-                RmEndSession, RmRegisterResources, RmShutdown, RmStartSession, CCH_RM_SESSION_KEY,
-                RM_UNIQUE_PROCESS,
-            },
-            Threading::{
-                GetProcessTimes, OpenProcess, WaitForSingleObject,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-            },
-        },
-    },
-};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const LAUNCHER_STOP_TIMEOUT: Duration = Duration::from_secs(36);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 // Unique whole-directory snapshots shipped from app-v0.2.0 through v1.1.2.
@@ -86,8 +69,11 @@ const KNOWN_TASKBOARD_SKILL_DIGESTS: [&str; 6] = [
     "ae74aec793decf6d9013c36f4b53e01723796a45567b77e9e9f22b4a168d3fbe",
 ];
 const TASKBOARD_PREFERRED_PORT: u16 = 47823;
+const TASKBOARD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const TASKBOARD_LISTEN_FD: i32 = 5;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +117,8 @@ struct LauncherState {
     codex_port: Mutex<Option<u16>>,
     #[cfg(target_os = "windows")]
     child_control: Mutex<Option<ChildStdin>>,
+    #[cfg(target_os = "windows")]
+    taskboard_url: Mutex<Option<String>>,
     _instance_lock: File,
     data_directory: PathBuf,
     log_path: PathBuf,
@@ -423,6 +411,8 @@ impl LauncherState {
             codex_port: Mutex::new(None),
             #[cfg(target_os = "windows")]
             child_control: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            taskboard_url: Mutex::new(None),
             _instance_lock: instance_lock,
             pid_record_path: data_directory.join("launcher-child.json"),
             data_directory,
@@ -622,6 +612,92 @@ fn taskboard_listener(_state: &LauncherState) -> Result<(Option<i32>, u16), Stri
     Ok((None, port))
 }
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn taskboard_health_ok(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(400)) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut body = String::new();
+    let _ = BufReader::new(stream).read_to_string(&mut body);
+    let header_end = body.find("\r\n\r\n").map(|index| index + 4).unwrap_or(0);
+    let headers = body.get(..header_end).unwrap_or(body.as_str());
+    let payload = body.get(header_end..).unwrap_or("");
+    headers.contains("200") && payload.contains("\"status\":\"ok\"")
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn wait_for_taskboard_ready(port: u16, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if taskboard_health_ok(port) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    Err(format!("任务面板服务在 127.0.0.1:{port} 未就绪"))
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn write_runtime_descriptor(state: &LauncherState, pid: u32, url: &str) -> Result<(), String> {
+    let path = state.data_directory.join("launcher-runtime.json");
+    let content = serde_json::json!({
+        "version": 1,
+        "pid": pid,
+        "url": url,
+    });
+    fs::write(&path, format!("{content}\n")).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn show_or_create_taskboard_window(app: &AppHandle, url: &str) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        if let Ok(parsed) = url.parse() {
+            let _ = window.navigate(parsed);
+        }
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    let window_app = app.clone();
+    let window_url = url.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = (|| {
+            let parsed = match window_url.parse() {
+                Ok(parsed) => parsed,
+                Err(error) => return Err(error.to_string()),
+            };
+            tauri::WebviewWindowBuilder::new(
+                &window_app,
+                "main",
+                tauri::WebviewUrl::External(parsed),
+            )
+            .title("Codex Taskboard")
+            .inner_size(1280.0, 840.0)
+            .min_inner_size(960.0, 640.0)
+            .center()
+            .visible(true)
+            .build()
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv().map_err(|error| error.to_string())?
+}
+
 #[cfg(target_os = "macos")]
 fn codex_port(state: &LauncherState) -> Result<u16, String> {
     let mut port = state.codex_port.lock().unwrap();
@@ -753,119 +829,6 @@ fn quit_codex_normally(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn find_codex_app(_home_directory: &Path) -> Option<PathBuf> {
-    let output = StdCommand::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-AppxPackage -Name OpenAI.Codex).InstallLocation",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let install_location = String::from_utf8_lossy(&output.stdout);
-    let candidate = PathBuf::from(install_location.trim())
-        .join("app")
-        .join("ChatGPT.exe");
-    candidate.is_file().then_some(candidate)
-}
-
-#[cfg(target_os = "windows")]
-fn ordinary_codex_process(app_path: &Path, codex_profile: &Path) -> Result<Option<u32>, String> {
-    let output = StdCommand::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference = 'Stop'; $app = $env:CODEX_TASKBOARD_CODEX_APP_PATH; $profile = $env:CODEX_TASKBOARD_CODEX_PROFILE; $name = [IO.Path]::GetFileName($app); $all = @(Get-CimInstance Win32_Process -Filter \"Name = '$name'\" | Where-Object { $_.ExecutablePath -eq $app }); $pids = @{}; foreach ($item in $all) { $pids[[uint32]$item.ProcessId] = $true }; $process = $all | Where-Object { $command = [string]$_.CommandLine; $isRoot = -not $pids.ContainsKey([uint32]$_.ParentProcessId); $isManaged = $command.IndexOf('--remote-debugging-pipe', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $command.IndexOf(('--user-data-dir=' + $profile), [StringComparison]::OrdinalIgnoreCase) -ge 0; $isRoot -and -not $isManaged } | Select-Object -First 1; if ($null -ne $process) { [Console]::Out.Write($process.ProcessId) }",
-        ])
-        .env("CODEX_TASKBOARD_CODEX_APP_PATH", app_path)
-        .env("CODEX_TASKBOARD_CODEX_PROFILE", codex_profile)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err("无法检查正在运行的 Codex".to_string());
-    }
-    let pid = String::from_utf8_lossy(&output.stdout);
-    let pid = pid.trim();
-    if pid.is_empty() {
-        return Ok(None);
-    }
-    pid.parse()
-        .map(Some)
-        .map_err(|_| "无法检查正在运行的 Codex".to_string())
-}
-
-#[cfg(target_os = "windows")]
-fn quit_codex_normally(pid: u32) -> Result<(), String> {
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            false,
-            pid,
-        )
-    }
-    .map_err(|error| error.to_string())?;
-    let mut creation_time = FILETIME::default();
-    let mut exit_time = FILETIME::default();
-    let mut kernel_time = FILETIME::default();
-    let mut user_time = FILETIME::default();
-    if unsafe {
-        GetProcessTimes(
-            process,
-            &mut creation_time,
-            &mut exit_time,
-            &mut kernel_time,
-            &mut user_time,
-        )
-    }
-    .is_err()
-    {
-        let _ = unsafe { CloseHandle(process) };
-        return Err("无法检查正在运行的 Codex".to_string());
-    }
-
-    let mut session = 0;
-    let mut session_key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
-    let started = unsafe { RmStartSession(&mut session, None, PWSTR(session_key.as_mut_ptr())) };
-    if started != ERROR_SUCCESS {
-        let _ = unsafe { CloseHandle(process) };
-        return Err("无法请求 Codex 退出".to_string());
-    }
-    let application = RM_UNIQUE_PROCESS {
-        dwProcessId: pid,
-        ProcessStartTime: creation_time,
-    };
-    let registered = unsafe { RmRegisterResources(session, None, Some(&[application]), None) };
-    let shutdown = if registered == ERROR_SUCCESS {
-        unsafe { RmShutdown(session, 0, None) }
-    } else {
-        registered
-    };
-    let _ = unsafe { RmEndSession(session) };
-    if shutdown != ERROR_SUCCESS {
-        let _ = unsafe { CloseHandle(process) };
-        return Err("Codex 没有接受退出请求".to_string());
-    }
-
-    let exited = unsafe {
-        WaitForSingleObject(
-            process,
-            LAUNCHER_STOP_TIMEOUT.as_millis().try_into().unwrap(),
-        )
-    } == WAIT_OBJECT_0;
-    let _ = unsafe { CloseHandle(process) };
-    if exited {
-        Ok(())
-    } else {
-        Err("Codex 尚未退出，任务面板没有启动".to_string())
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn find_codex_app(_home_directory: &Path) -> Option<PathBuf> {
     let candidate = PathBuf::from("/usr/lib/chatgpt/ChatGPT");
@@ -937,11 +900,6 @@ fn quit_codex_normally(pid: u32) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn missing_codex_app_message() -> String {
     "未找到官方 ChatGPT.app 或 Codex.app。请先安装到 Applications 文件夹。".to_string()
-}
-
-#[cfg(target_os = "windows")]
-fn missing_codex_app_message() -> String {
-    "未找到官方 Codex App。请先从 Microsoft Store 安装。".to_string()
 }
 
 #[cfg(target_os = "linux")]
@@ -1095,7 +1053,7 @@ fn process_matches_record(record: &LauncherPidRecord) -> bool {
     };
     let command = String::from_utf8_lossy(&output.stdout);
     command.contains(&*record.node_path.to_string_lossy())
-        && command.contains(r"scripts\codex-injector.mjs")
+        && command.contains(&*record.injector_path.to_string_lossy())
 }
 
 fn stop_recorded_child(state: &LauncherState) {
@@ -1190,8 +1148,13 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
                     if state.generation.load(Ordering::SeqCst) == generation
                         && snapshot.child_pid == Some(pid)
                     {
-                        snapshot.phase = "starting".into();
-                        snapshot.message = "任务面板服务已启动，正在注入 Codex…".into();
+                        if cfg!(target_os = "windows") {
+                            snapshot.phase = "running".into();
+                            snapshot.message = "任务面板服务已启动。".into();
+                        } else {
+                            snapshot.phase = "starting".into();
+                            snapshot.message = "任务面板服务已启动，正在注入 Codex…".into();
+                        }
                     }
                 });
             } else if !is_stderr && line.contains("\"openTaskboardSignalReady\":true") {
@@ -1238,6 +1201,110 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
     });
 }
 
+#[cfg(target_os = "windows")]
+fn start_windows_standalone_locked(
+    app: &AppHandle,
+    state: &Arc<LauncherState>,
+) -> Result<LauncherSnapshot, String> {
+    let home_directory = app.path().home_dir().map_err(|error| error.to_string())?;
+    let resource_directory = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?;
+    let app_root = resource_directory.join("app");
+    let server_path = app_root.join("server/index.mjs");
+    let node_path = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or_else(|| "无法定位 App 可执行文件目录".to_string())?
+        .join("node.exe");
+    stop_recorded_child(state);
+    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.intentional_stop.store(false, Ordering::SeqCst);
+    update_snapshot(app, state, |snapshot| {
+        snapshot.phase = "starting".into();
+        snapshot.message = "正在启动任务面板服务…".into();
+        snapshot.app_path = None;
+        snapshot.open_signal_pid = None;
+        snapshot.open_request_pending = false;
+    });
+
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let path_value = std::env::join_paths(
+        std::iter::once(resource_directory.join("bin")).chain(std::env::split_paths(&current_path)),
+    )
+    .map_err(|error| error.to_string())?;
+    let (_taskboard_listener_fd, taskboard_port) = taskboard_listener(state)?;
+    let _ = _taskboard_listener_fd;
+    let version = state.snapshot.lock().unwrap().version.clone();
+    let manage_taskboard_skill_path =
+        home_directory.join(".agents/skills/manage-taskboard/SKILL.md");
+    let taskboard_url = format!("http://127.0.0.1:{taskboard_port}");
+    let mut command = StdCommand::new(&node_path);
+    command
+        .arg(&server_path)
+        .env("CODEX_TASKBOARD_DATA_DIR", &state.data_directory)
+        .env(
+            "CODEX_TASKBOARD_RUNTIME_FILE",
+            state.data_directory.join("launcher-runtime.json"),
+        )
+        .env("CODEX_TASKBOARD_HOST", "127.0.0.1")
+        .env("CODEX_TASKBOARD_PORT", taskboard_port.to_string())
+        .env("CODEX_TASKBOARD_VERSION", &version)
+        .env("CODEX_TASKBOARD_SKILL_PATH", &manage_taskboard_skill_path)
+        .env_remove("CODEX_API_KEY")
+        .env_remove("CODEX_TASKBOARD_INSTANCE_TOKEN")
+        .env_remove("CODEX_TASKBOARD_INSTANCE_SECRET")
+        .env("HOST", "127.0.0.1")
+        .env("PATH", path_value)
+        .current_dir(&app_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let pid = child.id();
+    if let Err(error) = write_pid_record(state, pid, node_path, server_path) {
+        terminate_process_group(pid);
+        let _ = child.wait();
+        return Err(error);
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    *state.child.lock().unwrap() = Some(pid);
+    *state.taskboard_url.lock().unwrap() = Some(taskboard_url.clone());
+    update_snapshot(app, state, |snapshot| {
+        snapshot.child_pid = Some(pid);
+    });
+    append_log(
+        state,
+        &format!("Started standalone Taskboard {pid} on {taskboard_url}"),
+    );
+    if let Some(stdout) = stdout {
+        watch_launcher_output(stdout, false, app.clone(), state.clone(), pid, generation);
+    }
+    if let Some(stderr) = stderr {
+        watch_launcher_output(stderr, true, app.clone(), state.clone(), pid, generation);
+    }
+    if let Err(error) = wait_for_taskboard_ready(taskboard_port, TASKBOARD_READY_TIMEOUT) {
+        terminate_process_group(pid);
+        let _ = child.wait();
+        *state.child.lock().unwrap() = None;
+        let _ = state.child_control.lock().unwrap().take();
+        *state.taskboard_url.lock().unwrap() = None;
+        clear_pid_record(state, pid);
+        return Err(error);
+    }
+    write_runtime_descriptor(state, pid, &taskboard_url)?;
+    show_or_create_taskboard_window(app, &taskboard_url)?;
+    let snapshot = update_snapshot(app, state, |snapshot| {
+        snapshot.phase = "running".into();
+        snapshot.message = "任务面板已在独立窗口中打开。".into();
+    });
+    watch_launcher_child_exit(child, app.clone(), state.clone(), pid, generation);
+    Ok(snapshot)
+}
+
 fn start_launcher_locked(
     app: &AppHandle,
     state: &Arc<LauncherState>,
@@ -1246,6 +1313,13 @@ fn start_launcher_locked(
         return Ok(state.snapshot.lock().unwrap().clone());
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        return start_windows_standalone_locked(app, state);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
     let home_directory = app.path().home_dir().map_err(|error| error.to_string())?;
     let codex_app = find_codex_app(&home_directory).ok_or_else(missing_codex_app_message)?;
     let resource_directory = app
@@ -1345,13 +1419,10 @@ fn start_launcher_locked(
         .unwrap_or_else(|| home_directory.join(".config"))
         .join("Codex");
     let mut command = StdCommand::new(&node_path);
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     command.arg(&injector_path);
-    #[cfg(target_os = "windows")]
-    command.arg(r"scripts\codex-injector.mjs");
     #[cfg(target_os = "macos")]
     command.args(["--launch", "--watch", "--open", "--port", &codex_port]);
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     command.args(["--launch", "--watch", "--open", "--cdp-pipe"]);
     command
         .args(["--startup-token", &instance_token, "--app-path"])
@@ -1439,17 +1510,27 @@ fn start_launcher_locked(
         watch_launcher_output(stderr, true, app.clone(), state.clone(), pid, generation);
     }
 
-    let event_app = app.clone();
-    let event_state = state.clone();
+    watch_launcher_child_exit(child, app.clone(), state.clone(), pid, generation);
+    Ok(snapshot)
+    }
+}
+
+fn watch_launcher_child_exit(
+    mut child: std::process::Child,
+    app: AppHandle,
+    state: Arc<LauncherState>,
+    pid: u32,
+    generation: u64,
+) {
     thread::spawn(move || {
         let status = child.wait();
         let recovery_token = {
-            let mut current_child = event_state.child.lock().unwrap();
+            let mut current_child = state.child.lock().unwrap();
             if *current_child != Some(pid) {
                 None
             } else {
                 let recovery_token = generation + 1;
-                if event_state
+                if state
                     .generation
                     .compare_exchange(
                         generation,
@@ -1468,19 +1549,16 @@ fn start_launcher_locked(
         };
         #[cfg(target_os = "windows")]
         if recovery_token.is_some() {
-            let _ = event_state.child_control.lock().unwrap().take();
+            let _ = state.child_control.lock().unwrap().take();
         }
         let Some(recovery_token) = recovery_token else {
-            append_log(
-                &event_state,
-                &format!("Launcher child {pid} exited: {status:?}"),
-            );
+            append_log(&state, &format!("Launcher child {pid} exited: {status:?}"));
             terminate_process_group(pid);
             return;
         };
-        let intentional = event_state.intentional_stop.load(Ordering::SeqCst);
-        update_snapshot(&event_app, &event_state, |snapshot| {
-            if event_state.generation.load(Ordering::SeqCst) == recovery_token
+        let intentional = state.intentional_stop.load(Ordering::SeqCst);
+        update_snapshot(&app, &state, |snapshot| {
+            if state.generation.load(Ordering::SeqCst) == recovery_token
                 && snapshot.child_pid == Some(pid)
             {
                 snapshot.child_pid = None;
@@ -1491,32 +1569,29 @@ fn start_launcher_locked(
                 }
             }
         });
-        append_log(
-            &event_state,
-            &format!("Launcher child {pid} exited: {status:?}"),
-        );
+        append_log(&state, &format!("Launcher child {pid} exited: {status:?}"));
         terminate_process_group(pid);
-        clear_pid_record(&event_state, pid);
+        clear_pid_record(&state, pid);
         if intentional {
             return;
         }
         thread::sleep(Duration::from_secs(2));
         let (recovery_result, recovery_generation) = {
-            let _lifecycle = event_state.lifecycle.lock().unwrap();
-            if event_state.generation.load(Ordering::SeqCst) != recovery_token
-                || event_state.intentional_stop.load(Ordering::SeqCst)
-                || event_state.update_in_progress.load(Ordering::SeqCst)
+            let _lifecycle = state.lifecycle.lock().unwrap();
+            if state.generation.load(Ordering::SeqCst) != recovery_token
+                || state.intentional_stop.load(Ordering::SeqCst)
+                || state.update_in_progress.load(Ordering::SeqCst)
             {
                 return;
             }
-            let result = start_launcher_locked(&event_app, &event_state);
-            let generation = event_state.generation.load(Ordering::SeqCst);
+            let result = start_launcher_locked(&app, &state);
+            let generation = state.generation.load(Ordering::SeqCst);
             (result, generation)
         };
         if let Err(error) = recovery_result {
-            append_log(&event_state, &format!("Launcher recovery failed: {error}"));
-            update_snapshot(&event_app, &event_state, |snapshot| {
-                if event_state.generation.load(Ordering::SeqCst) == recovery_generation
+            append_log(&state, &format!("Launcher recovery failed: {error}"));
+            update_snapshot(&app, &state, |snapshot| {
+                if state.generation.load(Ordering::SeqCst) == recovery_generation
                     && snapshot.child_pid.is_none()
                 {
                     snapshot.phase = "error".into();
@@ -1525,13 +1600,12 @@ fn start_launcher_locked(
                 }
             });
             show_error_dialog(
-                &event_app,
+                &app,
                 "Codex Taskboard 恢复失败",
                 &format!("任务面板进程无法恢复：{error}\n\n请重新打开 App。"),
             );
         }
     });
-    Ok(snapshot)
 }
 
 fn start_launcher(app: &AppHandle, state: &Arc<LauncherState>) -> Result<LauncherSnapshot, String> {
@@ -1578,9 +1652,23 @@ fn restart_launcher(
     result
 }
 
-fn open_taskboard(state: &LauncherState) -> Result<(), String> {
-    state.snapshot.lock().unwrap().open_request_pending = true;
-    signal_pending_taskboard_open(state)
+fn open_taskboard(app: &AppHandle, state: &LauncherState) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let url = state
+            .taskboard_url
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "任务面板尚未启动。".to_string())?;
+        return show_or_create_taskboard_window(app, &url);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        state.snapshot.lock().unwrap().open_request_pending = true;
+        signal_pending_taskboard_open(state)
+    }
 }
 
 fn open_taskboard_in_browser(state: &LauncherState) -> Result<(), String> {
@@ -2086,6 +2174,7 @@ fn main() {
             )?;
             let check_update =
                 MenuItem::with_id(app, "check-update", "检查更新", false, None::<&str>)?;
+            #[cfg(not(target_os = "windows"))]
             let restart_codex =
                 MenuItem::with_id(app, "restart-codex", "重新打开 Codex", true, None::<&str>)?;
             let autostart_enabled = app.autolaunch().is_enabled()?;
@@ -2098,6 +2187,20 @@ fn main() {
                 None::<&str>,
             )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            #[cfg(target_os = "windows")]
+            let tray_menu = Menu::with_items(
+                app,
+                &[
+                    &app_info,
+                    &launcher_status,
+                    &open_taskboard_item,
+                    &open_taskboard_web,
+                    &check_update,
+                    &autostart,
+                    &quit,
+                ],
+            )?;
+            #[cfg(not(target_os = "windows"))]
             let tray_menu = Menu::with_items(
                 app,
                 &[
@@ -2140,13 +2243,9 @@ fn main() {
                         let state = Arc::clone(state.inner());
                         let app = app.clone();
                         tauri::async_runtime::spawn_blocking(move || {
-                            if let Err(error) = open_taskboard(&state) {
+                            if let Err(error) = open_taskboard(&app, &state) {
                                 append_log(&state, &format!("Launcher menu open failed: {error}"));
-                                show_error_dialog(
-                                    &app,
-                                    "Codex Taskboard 打开失败",
-                                    &format!("{error}\n\n请确认 Codex 正在运行。"),
-                                );
+                                show_error_dialog(&app, "Codex Taskboard 打开失败", &error);
                             }
                         });
                     }
@@ -2278,13 +2377,14 @@ fn main() {
                         snapshot.phase = "error".into();
                         snapshot.message = error.clone();
                     });
-                    show_error_dialog(
-                        &app_handle,
-                        "Codex Taskboard 启动失败",
-                        &format!(
-                            "{error}\n\n请确认官方 Codex/ChatGPT App 已安装。详情见启动日志。"
-                        ),
+                    #[cfg(target_os = "windows")]
+                    let startup_error =
+                        format!("{error}\n\n任务面板服务未能启动。详情见启动日志。");
+                    #[cfg(not(target_os = "windows"))]
+                    let startup_error = format!(
+                        "{error}\n\n请确认官方 Codex/ChatGPT App 已安装。详情见启动日志。"
                     );
+                    show_error_dialog(&app_handle, "Codex Taskboard 启动失败", &startup_error);
                 }
                 offer_update(
                     &app_handle,
@@ -2306,7 +2406,8 @@ fn main() {
             let Some(state) = app_handle.try_state::<Arc<LauncherState>>() else {
                 return;
             };
-            let result = start_launcher(app_handle, &state).and_then(|_| open_taskboard(&state));
+            let result =
+                start_launcher(app_handle, &state).and_then(|_| open_taskboard(app_handle, &state));
             if let Err(error) = result {
                 append_log(&state, &format!("Launcher panel reopen failed: {error}"));
                 show_error_dialog(
@@ -2314,6 +2415,16 @@ fn main() {
                     "Codex Taskboard 打开失败",
                     &format!("{error}\n\n请确认官方 Codex/ChatGPT App 已安装。"),
                 );
+            }
+        }
+        #[cfg(target_os = "windows")]
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } => {
+            if label == "main" {
+                app_handle.exit(0);
             }
         }
         tauri::RunEvent::ExitRequested { code, api, .. } => {
@@ -2339,4 +2450,40 @@ fn main() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod standalone_lifecycle_tests {
+    use super::wait_for_taskboard_ready;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn health_ok_accepts_taskboard_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let body = "{\"status\":\"ok\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        wait_for_taskboard_ready(port, Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn wait_for_taskboard_ready_times_out_when_nothing_listens() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let result = wait_for_taskboard_ready(port, Duration::from_millis(250));
+        assert!(result.is_err());
+    }
 }
