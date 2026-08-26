@@ -1206,7 +1206,6 @@ fn start_windows_standalone_locked(
     app: &AppHandle,
     state: &Arc<LauncherState>,
 ) -> Result<LauncherSnapshot, String> {
-    let home_directory = app.path().home_dir().map_err(|error| error.to_string())?;
     let resource_directory = app
         .path()
         .resource_dir()
@@ -1237,8 +1236,10 @@ fn start_windows_standalone_locked(
     let (_taskboard_listener_fd, taskboard_port) = taskboard_listener(state)?;
     let _ = _taskboard_listener_fd;
     let version = state.snapshot.lock().unwrap().version.clone();
-    let manage_taskboard_skill_path =
-        home_directory.join(".agents/skills/manage-taskboard/SKILL.md");
+    // The automation prompt derives app/cli/taskctl.mjs from this Skill path,
+    // so advertise the bundled copy. The global copy remains installed for
+    // normal Codex Skill discovery.
+    let manage_taskboard_skill_path = app_root.join("skills/manage-taskboard/SKILL.md");
     let taskboard_url = format!("http://127.0.0.1:{taskboard_port}");
     let mut command = StdCommand::new(&node_path);
     command
@@ -1406,8 +1407,8 @@ fn start_launcher_locked(
     let instance_token = Uuid::new_v4().to_string();
     let instance_secret = Uuid::new_v4().to_string();
     let version = state.snapshot.lock().unwrap().version.clone();
-    let manage_taskboard_skill_path =
-        home_directory.join(".agents/skills/manage-taskboard/SKILL.md");
+    // Keep the prompt-linked Skill beside the bundled CLI it resolves.
+    let manage_taskboard_skill_path = app_root.join("skills/manage-taskboard/SKILL.md");
     #[cfg(target_os = "macos")]
     let codex_source_profile = home_directory.join("Library/Application Support/Codex");
     #[cfg(target_os = "windows")]

@@ -87,6 +87,10 @@ test("Windows standalone starts the bundled service in a native window and never
     launcherSource,
     /fn start_windows_standalone_locked[\s\S]*?--cdp-pipe[\s\S]*?fn start_launcher_locked/,
   );
+  assert.match(
+    launcherSource,
+    /app_root\.join\("skills\/manage-taskboard\/SKILL\.md"\)/,
+  );
 });
 
 test("Windows CI uploads the NSIS installer with the pinned Node 24 artifact action", () => {
