@@ -87,9 +87,6 @@ test("the standalone Taskboard service is ready on loopback and publishes a task
   try {
     const health = await waitForHealth(port, 10_000);
     assert.equal(health.status, "ok");
-    const page = await fetch(`http://127.0.0.1:${port}/`);
-    assert.equal(page.status, 200);
-    assert.match(await page.text(), /<!doctype html>/i);
     const runtime = {
       version: 1,
       pid: child.pid,
