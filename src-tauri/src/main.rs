@@ -1242,7 +1242,10 @@ fn start_windows_standalone_locked(
     let taskboard_url = format!("http://127.0.0.1:{taskboard_port}");
     let mut command = StdCommand::new(&node_path);
     command
-        .arg(&server_path)
+        // Keep the entry point relative to app_root. The installed resource path
+        // contains a space ("Codex Taskboard"), which Node can otherwise receive
+        // as a truncated Windows main-module argument.
+        .arg(r"server\index.mjs")
         .env("CODEX_TASKBOARD_DATA_DIR", &state.data_directory)
         .env(
             "CODEX_TASKBOARD_RUNTIME_FILE",

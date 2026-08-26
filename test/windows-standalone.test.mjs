@@ -53,6 +53,7 @@ test("Windows standalone policy keeps the local service off the Codex injector p
   assert.match(launcherSource, /wait_for_taskboard_ready\(taskboard_port, TASKBOARD_READY_TIMEOUT\)/);
   assert.match(launcherSource, /show_or_create_taskboard_window\(app, &taskboard_url\)/);
   assert.match(launcherSource, /write_runtime_descriptor\(state, pid, &taskboard_url\)/);
+  assert.match(launcherSource, /\.arg\(r"server\\index\.mjs"\)/);
   assert.doesNotMatch(
     launcherSource,
     /fn start_windows_standalone_locked[\s\S]*?find_codex_app[\s\S]*?fn start_launcher_locked/,
