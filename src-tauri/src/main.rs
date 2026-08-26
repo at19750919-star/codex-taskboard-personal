@@ -675,7 +675,7 @@ fn show_or_create_taskboard_window(app: &AppHandle, url: &str) -> Result<(), Str
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let result = (|| {
-            let parsed = match window_url.parse() {
+            let parsed = match window_url.parse::<tauri::Url>() {
                 Ok(parsed) => parsed,
                 Err(error) => return Err(error.to_string()),
             };
